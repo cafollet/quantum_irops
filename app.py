@@ -23,7 +23,7 @@ with ui.div(
         "IROPS operations Dashboard", style="color: white; margin: 0; font-weight: 400;"
     )
 
-with ui.layout_columns(col_widths=[6, 6]):
+with ui.layout_columns(col_widths=[4, 4, 4]):
     # Affected PNRs pie chart
     with ui.card():
         ui.card_header("Affected PNRs")
@@ -50,6 +50,7 @@ with ui.layout_columns(col_widths=[6, 6]):
             fig.update_traces(textinfo="percent+label")
             return fig
 
+    # Affected flights pie chart
     with ui.card():
         ui.card_header("Affected Flights")
 
@@ -72,6 +73,54 @@ with ui.layout_columns(col_widths=[6, 6]):
                 color_discrete_map={"Affected": "#d3462d", "Non-Affected": "#363636"},
             )
             fig.update_traces(textinfo="percent+label")
+            return fig
+
+    with ui.card():
+        ui.card_header("Affected Passengers")
+
+        @render_plotly
+        def passengers_affected():
+            # 1. DATA PREPARATION
+            passengers_affected = df_pnrs.filter(pl.col("Affected") == 1)
+
+            df_viz = (
+                passengers_affected
+                # -- ALIASING VALUES --
+                # Replace 'Y' with 'Economy' and 'C' with 'Business'
+                # and rename the column to 'Cabin Class'
+                .with_columns(
+                    pl.col("CABIN_CD")
+                    .replace({"Y": "Economy", "C": "Business"})
+                    .alias("Cabin Class")
+                )
+                .group_by(["DEP_DT", "Cabin Class"])
+                .agg(pl.col("PAX_CNT").sum().alias("Total_Passengers"))
+                .sort("DEP_DT")
+            )
+
+            # 2. CREATE CHART
+            fig = px.bar(
+                df_viz,
+                x="DEP_DT",
+                y="Total_Passengers",
+                color="Cabin Class",
+                # -- STACKING ORDER --
+                # This tells Plotly: Put Economy at the bottom, Business on top.
+                category_orders={"Cabin Class": ["Economy", "Business"]},
+                # Custom colors (Business = Blue, Economy = Orange)
+                color_discrete_map={"Business": "#d3462d", "Economy": "#363636"},
+            )
+
+            # 3. STYLING
+            fig.update_layout(
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                margin=dict(l=0, r=0, t=10, b=0),
+                xaxis_title="Departure Date",
+                yaxis_title="Passengers",
+                legend_title="",
+            )
+
             return fig
 
 
