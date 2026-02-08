@@ -1,13 +1,14 @@
 [project]
 name = "quantum_irops"
 version = "0.1.0"
-description = "IROPS pipeline"
+description = "QUBO-based airline passenger re-accommodation pipeline"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "airportsdata>=20260205",
     "jupyter>=1.1.1",
     "matplotlib>=3.10.8",
+    "numpy>=2.1",
     "pandas>=3.0.0",
     "plotly>=6.5.2",
     "polars>=1.37.1",
@@ -15,3 +16,9 @@ dependencies = [
     "shinywidgets>=0.7.1",
 ]
 
+[project.optional-dependencies]
+neal = ["dwave-neal>=0.6"]
+dwave = ["dwave-ocean-sdk>=8.0"]
+
+[project.scripts]
+reaccom = "pipeline.cli:main"
