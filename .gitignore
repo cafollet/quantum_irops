@@ -217,3 +217,8 @@ __marimo__/
 
 */.DS_Store
 .DS_Store
+
+# 1. Ignore everything in the output_files
+output_files/*
+# Only keep the .gitkeep. This is to be able to commit the dir.
+!output_files/.gitkeep
