@@ -16,6 +16,12 @@ dependencies = [
     "shinywidgets>=0.7.1",
 ]
 
+[tool.uv]
+package = true
+
+[tool.setuptools]
+packages = ["pipeline"]
+
 [project.optional-dependencies]
 neal = ["dwave-neal>=0.6"]
 dwave = ["dwave-ocean-sdk>=8.0"]
