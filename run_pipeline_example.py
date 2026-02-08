@@ -7,6 +7,7 @@ logging.basicConfig(level=logging.INFO)
 
 assignments, unbooked = run_pipeline(
     pnr="notebooks/data/PRMI_DM_ALL_PNRs.csv",
+    method="neal",
     cancelled="notebooks/data/PRMI-DM_TARGET_FLIGHTS.csv",
     available="notebooks/data/PRMI-DM-AVAILABLE_FLIGHTS.csv",
     batch_strategy="by_priority_tier",
