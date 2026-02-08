@@ -2,6 +2,7 @@ from shiny.express import ui, render
 from shinywidgets import render_plotly
 import polars as pl
 import plotly.express as px
+import plotly.graph_objects as go
 import numpy as np
 import airportsdata
 from utils import get_data_frames
@@ -87,61 +88,69 @@ def prepare_flight_paths(df_in):
 
     origins = valid_flights.select(
         pl.col("DEP_KEY"),
-        pl.col("ORIG_LAT").alias("lat"),
-        pl.col("ORIG_LONG").alias("lon"),
+        pl.col("ORIG_CD").alias("City_Code"),
+        pl.col("ORIG_LAT").alias("latitude"),
+        pl.col("ORIG_LONG").alias("longitude"),
         pl.lit("Origin").alias("Type"),
         pl.col("Affected_Passengers"),
     )
     dests = valid_flights.select(
         pl.col("DEP_KEY"),
-        pl.col("DEST_LAT").alias("lat"),
-        pl.col("DEST_LONG").alias("lon"),
-        pl.lit("Dest").alias("Type"),
+        pl.col("DEST_CD").alias("City_Code"),
+        pl.col("DEST_LAT").alias("latitude"),
+        pl.col("DEST_LONG").alias("longitude"),
+        pl.lit("Destination").alias("Type"),
         pl.col("Affected_Passengers"),
     )
     return pl.concat([origins, dests], how="vertical")
 
 
-df_plot = prepare_flight_paths(df_affected_flights)
+df_plot = prepare_flight_paths(df_affected_flights).sort("DEP_KEY")
 
 with ui.card(full_screen=True, height="500px"):
     ui.card_header("Affected Flight Routes")
 
     @render_plotly
     def flight_map():
-        fig = px.line_mapbox(
+        fig = px.line_map(
             df_plot,
-            lat="lat",
-            lon="lon",
+            lat="latitude",
+            lon="longitude",
             line_group="DEP_KEY",
-            color="Type",
-            mapbox_style="carto-darkmatter",
+            color_discrete_sequence=["#555555"],
+            map_style="carto-darkmatter",
             zoom=1,
             center={"lat": 20, "lon": 0},
         )
 
-        fig_markers = px.scatter_mapbox(
+        fig_markers = px.scatter_map(
             df_plot,
-            lat="lat",
-            lon="lon",
+            lat="latitude",
+            lon="longitude",
             size="Affected_Passengers",
             size_max=15,
             color="Type",
-            hover_name="DEP_KEY",
-            mapbox_style="carto-darkmatter",
+            color_discrete_map={
+                "Origin": "#d3462d",
+                # "Destination": "#2d8ad3",
+            },
+            hover_name="City_Code",
         )
 
         fig.add_traces(fig_markers.data)
 
+        # Clean up layout
         fig.update_layout(
             margin={"r": 0, "t": 0, "l": 0, "b": 0},
-            showlegend=False,
+            showlegend=True,
             paper_bgcolor="rgba(0,0,0,0)",
         )
 
         fig.update_traces(
-            selector=dict(type="scattermapbox", mode="lines"),
-            line=dict(width=2, color="#d3462d"),
+            selector=dict(
+                type="scattermap", mode="lines"
+            ),  # Selects only the line layer
+            line=dict(width=1),
         )
 
         return fig
