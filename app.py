@@ -78,10 +78,10 @@ with ui.layout_columns(col_widths=[4, 4, 4]):
 
         @render_plotly
         def passengers_affected():
-            passengers_affected = df_pnrs.filter(pl.col("Affected") == 1)
+            def_pass_affected = df_pnrs.filter(pl.col("Affected") == 1)
 
-            passengers_affected = (
-                passengers_affected.with_columns(
+            def_pass_affected = (
+                def_pass_affected.with_columns(
                     pl.col("CABIN_CD")
                     .replace({"Y": "Economy", "C": "Business"})
                     .alias("Cabin Class")
@@ -92,7 +92,7 @@ with ui.layout_columns(col_widths=[4, 4, 4]):
             )
 
             fig = px.bar(
-                passengers_affected,
+                def_pass_affected,
                 x="DEP_DT",
                 y="Total_Passengers",
                 color="Cabin Class",
@@ -115,7 +115,7 @@ with ui.layout_columns(col_widths=[4, 4, 4]):
             return fig
 
 
-## Map plot ##
+########## Map plot #########
 def prepare_flight_paths(df_in):
 
     df_in = df_in.with_columns(
@@ -193,3 +193,7 @@ with ui.card(full_screen=True, height="500px"):
         )
 
         return fig
+
+
+with ui.card(full_screen=True, height="500px"):
+    ui.card_header("Run Optimizer")
