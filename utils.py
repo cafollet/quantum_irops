@@ -1,5 +1,7 @@
 import polars as pl
 import airportsdata
+import logging
+import io
 
 
 def get_airport_coord(affected_flights: pl.DataFrame) -> pl.DataFrame:
@@ -30,3 +32,21 @@ def get_data_frames(canceled_path, available_path, pnr_path):
         .alias("Affected")
     )
     return df_affected_flights, df_available_flights, df_pnrs
+
+
+class QueueHandler(logging.Handler):
+    """
+    Handles sending the logs from the running process
+    to the terminal.
+    """
+
+    def __init__(self, queue):
+        super().__init__()
+        self.queue = queue
+
+    def emit(self, record):
+        try:
+            log_entry = self.format(record)
+            self.queue.put(log_entry)
+        except Exception as e:
+            self.handleError(record)
