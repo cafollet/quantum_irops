@@ -80,15 +80,10 @@ with ui.layout_columns(col_widths=[4, 4, 4]):
 
         @render_plotly
         def passengers_affected():
-            # 1. DATA PREPARATION
             passengers_affected = df_pnrs.filter(pl.col("Affected") == 1)
 
-            df_viz = (
-                passengers_affected
-                # -- ALIASING VALUES --
-                # Replace 'Y' with 'Economy' and 'C' with 'Business'
-                # and rename the column to 'Cabin Class'
-                .with_columns(
+            passengers_affected = (
+                passengers_affected.with_columns(
                     pl.col("CABIN_CD")
                     .replace({"Y": "Economy", "C": "Business"})
                     .alias("Cabin Class")
@@ -98,9 +93,8 @@ with ui.layout_columns(col_widths=[4, 4, 4]):
                 .sort("DEP_DT")
             )
 
-            # 2. CREATE CHART
             fig = px.bar(
-                df_viz,
+                passengers_affected,
                 x="DEP_DT",
                 y="Total_Passengers",
                 color="Cabin Class",
@@ -111,7 +105,6 @@ with ui.layout_columns(col_widths=[4, 4, 4]):
                 color_discrete_map={"Business": "#d3462d", "Economy": "#363636"},
             )
 
-            # 3. STYLING
             fig.update_layout(
                 paper_bgcolor="rgba(0,0,0,0)",
                 plot_bgcolor="rgba(0,0,0,0)",
@@ -188,7 +181,6 @@ with ui.card(full_screen=True, height="500px"):
 
         fig.add_traces(fig_markers.data)
 
-        # Clean up layout
         fig.update_layout(
             margin={"r": 0, "t": 0, "l": 0, "b": 0},
             showlegend=True,
