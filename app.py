@@ -223,7 +223,7 @@ def run_optimization_task(params, msg_queue, shared_state):
             "cancelled": "notebooks/data/PRMI-DM_TARGET_FLIGHTS.csv",
             "available": "notebooks/data/PRMI-DM-AVAILABLE_FLIGHTS.csv",
             "batch_strategy": batch_strategy,
-            "priority_bins": 5,
+            "priority_bins": 30,
             "output_unbooked": "output_files/priority_batch_unbooked_updated.csv",
             "output_assignments": "output_files/priority_batch_results_updated.csv",
         }
@@ -382,4 +382,4 @@ def poll_background_thread():
         else:
             ui.notification_show("Optimization Failed", type="error")
             return
-    reactive.invalidate_later(20)
+    reactive.invalidate_later(1)
