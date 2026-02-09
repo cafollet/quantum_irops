@@ -1,10 +1,8 @@
-from shiny.express import ui, render
+from shiny.express import ui
 from shinywidgets import render_plotly
 import polars as pl
 import plotly.express as px
-import plotly.graph_objects as go
-import numpy as np
-import airportsdata
+
 from utils import get_data_frames
 
 canceled_flights = "./notebooks/data/PRMI-DM_TARGET_FLIGHTS.csv"
