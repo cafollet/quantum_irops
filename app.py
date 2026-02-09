@@ -100,7 +100,7 @@ with ui.layout_columns(col_widths=[4, 4, 4]):
                 # This tells Plotly: Put Economy at the bottom, Business on top.
                 category_orders={"Cabin Class": ["Economy", "Business"]},
                 # Custom colors (Business = Blue, Economy = Orange)
-                color_discrete_map={"Business": "#d3462d", "Economy": "#363636"},
+                color_discrete_map={"Business": "#A09F9F", "Economy": "#363636"},
             )
 
             fig.update_layout(
