@@ -5,12 +5,15 @@ DataFrame schema.  CapacityTracker maintains remaining seat counts across
 batches so later batches see accurate availability.
 """
 
+import logging
 from typing import Dict, List, Tuple
 
 import pandas as pd
 
 from .models import Flight, Passenger
 from .types import Itinerary
+
+logger = logging.getLogger(__name__)
 
 # Output column order
 OUTPUT_COLUMNS = [
@@ -70,6 +73,13 @@ class SolutionInterpreter:
         assignments = []
         unbooked = []
 
+        # Guard against solver constraint violations: the one-assignment
+        # penalty may not be tight enough for the SA to converge, leaving
+        # multiple x_{i,k}=1 for the same passenger segment.
+        # Key is passenger index i — unique per (RECLOC, DEP_KEY) segment
+        # within this batch.
+        assigned_pax: set = set()
+
         for idx, val in solution.items():
             if val != 1:
                 continue
@@ -79,8 +89,27 @@ class SolutionInterpreter:
 
             if info[0] == "assign":
                 _, i, k = info
+
+                if i in assigned_pax:
+                    logger.debug(
+                        "Passenger %d already assigned (idx=%d k=%d); "
+                        "skipping extra (solver constraint violation).",
+                        i, idx, k,
+                    )
+                    continue
+
+                assigned_pax.add(i)
                 pax = self.passengers[i]
                 itin = self.itineraries[i][k]
+
+                # _itin_id groups all alternate legs of this single assignment
+                # together and is used by _merge_results for cross-batch
+                # deduplication.  Including pax.dep_key (the ORIGINAL flight
+                # key) means two segments of the same RECLOC (e.g. outbound
+                # leg DEP_KEY_A and return leg DEP_KEY_B) produce distinct
+                # _itin_ids and are never collapsed into one.
+                first_alt_key = self.flights[itin.legs[0][0]].dep_key
+                itin_id = f"{pax.recloc}|{pax.dep_key}|{first_alt_key}"
 
                 for leg_num, (j, cabin) in enumerate(itin.legs):
                     flt = self.flights[j]
@@ -144,11 +173,18 @@ class SolutionInterpreter:
                                 if first_flt.dep_dtml and pax.dep_dtml
                                 else 0.0
                             ),
+                            # Internal tag — stripped by _merge_results after
+                            # cross-batch deduplication.
+                            "_itin_id": itin_id,
                         }
                     )
 
             elif info[0] == "slack":
                 _, i = info
+                # If the passenger segment was already assigned, don't also
+                # emit an unbooked row (another form of constraint violation).
+                if i in assigned_pax:
+                    continue
                 pax = self.passengers[i]
                 if pax.is_affected:
                     unbooked.append(
@@ -192,31 +228,28 @@ class SolutionInterpreter:
                         }
                     )
 
-        assign_df = pd.DataFrame(assignments, columns=OUTPUT_COLUMNS)
+        if assignments:
+            assign_df = pd.DataFrame(assignments)
+            cols = [c for c in OUTPUT_COLUMNS if c in assign_df.columns] + ["_itin_id"]
+            assign_df = assign_df[cols]
+        else:
+            assign_df = pd.DataFrame(columns=OUTPUT_COLUMNS + ["_itin_id"])
+
         unbook_df = pd.DataFrame(unbooked, columns=OUTPUT_COLUMNS)
         return assign_df, unbook_df
 
 
 class CapacityTracker:
-    """Tracks remaining seat counts across batches.
-
-    After each batch is solved, call consume() for every assigned (flight,
-    cabin, pax_cnt) tuple, then update_flights() to get a fresh Flight list
-    with adjusted availability for the next batch.
-    """
+    """Tracks remaining seat counts across batches."""
 
     def __init__(self, flights: List[Flight]):
-        # Start with the available seat counts from the input data.
         self.remaining_c: Dict[int, int] = {j: f.c_avail_cnt for j, f in enumerate(flights)}
         self.remaining_y: Dict[int, int] = {j: f.y_avail_cnt for j, f in enumerate(flights)}
-        # Track total consumed so we can report over-booking accurately.
         self.consumed_c: Dict[int, int] = {j: 0 for j in range(len(flights))}
         self.consumed_y: Dict[int, int] = {j: 0 for j in range(len(flights))}
 
     def consume(self, flight_idx: int, cabin: str, count: int):
-        """Deduct count seats from the tracker. negative remaining means the flight
-        is overbooked, which is reported to downstream batches and logs.
-        """
+        """Deduct count seats. Negative remaining = overbooked."""
         if cabin == "C":
             self.remaining_c[flight_idx] -= count
             self.consumed_c[flight_idx] += count
@@ -236,17 +269,11 @@ class CapacityTracker:
         return result
 
     def update_flights(self, flights: List[Flight]) -> List[Flight]:
-        """Return a new Flight list with availability adjusted for consumed seats.
-
-        avail_cnt is clamped to >= 0 for the QUBO , but pax_cnt reflects reality including
-        any over-booking so that _check_capacity can correctly reject overbooked
-        flights even when overbooking_allowed=True.
-        """
+        """Return a new Flight list with availability adjusted for consumed seats."""
         updated = []
         for j, f in enumerate(flights):
             new_c_avail = max(0, self.remaining_c.get(j, 0))
             new_y_avail = max(0, self.remaining_y.get(j, 0))
-            # pax_cnt = original + however many we actually consumed (may exceed aul)
             new_c_pax = f.c_pax_cnt + self.consumed_c.get(j, 0)
             new_y_pax = f.y_pax_cnt + self.consumed_y.get(j, 0)
             updated.append(

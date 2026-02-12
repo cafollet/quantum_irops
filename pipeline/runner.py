@@ -1,7 +1,7 @@
 """Main pipeline orchestrator and public API function.
 
-ReaccommodationPipeline wires together DataProcessor → PreprocessingEngine
-→ QUBOFormulator → QUBOSolver → SolutionInterpreter and handles batch
+ReaccommodationPipeline wires together DataProcessor -> PreprocessingEngine
+-> QUBOFormulator -> QUBOSolver -> SolutionInterpreter and handles batch
 iteration with live capacity tracking.
 
 run_pipeline() is the single callable entry point for external callers.
@@ -20,6 +20,11 @@ from .results import CapacityTracker, SolutionInterpreter
 from .types import BatchStrategy, CandidateFilterLevel
 
 logger = logging.getLogger(__name__)
+
+# Composite key that uniquely identifies one passenger segment.
+# A RECLOC alone is not unique — the same booking reference can contain
+# multiple legs (e.g. outbound KHL->TPH and return TPH->KHL).
+_PNR_KEY = ["RECLOC", "DEP_KEY"]
 
 
 class ReaccommodationPipeline:
@@ -63,14 +68,12 @@ class ReaccommodationPipeline:
         method : {'sa', 'neal', 'dwave'}
         **solver_kwargs : passed through to the chosen solver backend.
         """
-        # Load inputs
         logger.info("Loading input data...")
         pnr_df = self._to_dataframe(pnr_csv, "pnr_csv")
         target_df = self._to_dataframe(target_csv, "target_csv")
         available_df = self._to_dataframe(available_csv, "available_csv")
         self.processor.load_data(pnr_df, target_df, available_df)
 
-        # Validate multi-leg?
         if self.pp_config.multi_leg.enable_multi_leg:
             logger.warning(
                 "MULTI-LEG ITINERARIES ENABLED (max_legs=%d). "
@@ -78,13 +81,11 @@ class ReaccommodationPipeline:
                 self.pp_config.multi_leg.max_legs,
             )
 
-        # Preprocess
         self.preprocessor = PreprocessingEngine(
             self.processor, self.pp_config, self.weights
         )
         batches = self.preprocessor.prepare()
 
-        # Solve batches
         cap_tracker = CapacityTracker(self.processor.available_flights)
         dep_key_to_idx = {
             f.dep_key: j for j, f in enumerate(self.processor.available_flights)
@@ -94,8 +95,6 @@ class ReaccommodationPipeline:
         for batch in batches:
             logger.info("\n--- Solving: %s ---", batch["batch_id"])
 
-            # Always refresh flights with current capacity so every batch sees
-            # accurate availability
             batch["flights"] = cap_tracker.update_flights(
                 self.processor.available_flights
             )
@@ -130,17 +129,28 @@ class ReaccommodationPipeline:
             adf, udf = interpreter.interpret(sol)
             self.batch_results.append((adf, udf))
 
-            # Update capacity
+            # Update capacity.  Guard with composite (RECLOC, DEP_KEY, alt_dep_key,
+            # cabin) so two different segments of the same RECLOC going to the
+            # same alt flight each correctly consume their own seats, but a
+            # single segment is never double-counted.
             if len(adf):
+                seen_segment_flight: set = set()
                 for _, row in adf.iterrows():
-                    dep_key = row.get("ALT_DEP_KEY", "")
+                    alt_dep_key = row.get("ALT_DEP_KEY", "")
                     cabin = row.get("ALT_CABIN_CD", "")
                     pax_cnt = row.get("PAX_CNT", 0)
-                    flt_idx = dep_key_to_idx.get(dep_key)
+                    flt_idx = dep_key_to_idx.get(alt_dep_key)
                     if flt_idx is not None and cabin and pax_cnt:
-                        cap_tracker.consume(flt_idx, cabin, int(pax_cnt))
+                        key = (
+                            row.get("RECLOC"),
+                            row.get("DEP_KEY"),   # original segment key
+                            alt_dep_key,
+                            cabin,
+                        )
+                        if key not in seen_segment_flight:
+                            seen_segment_flight.add(key)
+                            cap_tracker.consume(flt_idx, cabin, int(pax_cnt))
 
-        # Merge batches
         self._merge_results()
         return self.all_assignments, self.all_unbooked
 
@@ -156,16 +166,49 @@ class ReaccommodationPipeline:
         )
 
         if len(self.all_assignments):
-            self.all_assignments = self.all_assignments.drop_duplicates(
-                subset=["RECLOC", "ALT_FLT_NUM", "ALT_ORIG_CD", "ALT_DEST_CD"],
-                keep="first",
-            )
+            if "_itin_id" in self.all_assignments.columns:
+                # For each (RECLOC, DEP_KEY) segment keep only the rows that
+                # belong to the FIRST itinerary assigned (highest-priority
+                # batch).  All alternate legs of a multi-leg itinerary share
+                # the same _itin_id so they are kept together.
+                first_itin = (
+                    self.all_assignments
+                    .drop_duplicates(subset=_PNR_KEY, keep="first")[_PNR_KEY + ["_itin_id"]]
+                    .rename(columns={"_itin_id": "_first_itin_id"})
+                )
+                merged = self.all_assignments.merge(first_itin, on=_PNR_KEY, how="left")
+                mask = merged["_itin_id"] == merged["_first_itin_id"]
+                dropped = int((~mask).sum())
+                if dropped:
+                    logger.warning(
+                        "%d over-assigned row(s) removed during merge "
+                        "(solver constraint violations or cross-batch duplicates).",
+                        dropped,
+                    )
+                self.all_assignments = (
+                    self.all_assignments[mask]
+                    .drop(columns=["_itin_id"])
+                    .reset_index(drop=True)
+                )
+            else:
+                # Fallback for DataFrames that pre-date the _itin_id field.
+                self.all_assignments = self.all_assignments.drop_duplicates(
+                    subset=_PNR_KEY + ["ALT_DEP_KEY", "ALT_CABIN_CD"],
+                    keep="first",
+                )
 
+        # Remove from unbooked any segment that was successfully assigned.
+        # Match on (RECLOC, DEP_KEY) so a passenger with two affected legs
+        # is only marked fully booked when BOTH legs have assignments.
         if len(self.all_unbooked) and len(self.all_assignments):
-            booked = set(self.all_assignments["RECLOC"])
-            self.all_unbooked = self.all_unbooked[
-                ~self.all_unbooked["RECLOC"].isin(booked)
-            ]
+            booked_segments = self.all_assignments[_PNR_KEY].drop_duplicates()
+            self.all_unbooked = (
+                self.all_unbooked
+                .merge(booked_segments.assign(_booked=True), on=_PNR_KEY, how="left")
+                .pipe(lambda df: df[df["_booked"].isna()])
+                .drop(columns=["_booked"])
+                .reset_index(drop=True)
+            )
 
     def summary(self):
         total_pax = sum(p.pax_cnt for p in self.processor.affected_passengers)
@@ -204,7 +247,7 @@ class ReaccommodationPipeline:
             print(f"    Pax with no options:            {s.get('passengers_with_no_options', 0)}")
             print(f"    Estimated QUBO vars:            {s.get('estimated_total_vars', 0)}")
             if s.get("priority_tier_info"):
-                print(f"\n  Priority Tier Breakdown (highest → lowest CVM):")
+                print(f"\n  Priority Tier Breakdown (highest -> lowest CVM):")
                 for t in s["priority_tier_info"]:
                     print(
                         f"    {t['label']}  CVM [{t['cvm_lo']:.3f}, {t['cvm_hi']:.3f}]"
@@ -229,7 +272,7 @@ class ReaccommodationPipeline:
 
         print("=" * 70)
 
-# API function call
+
 def run_pipeline(
     pnr,
     cancelled,
@@ -315,7 +358,7 @@ def run_pipeline(
         Ignored when ``priority_tiers`` is set.
     priority_tiers : list[float] | None
         Manual CVM split points (ascending). If provided, overrides
-        ``priority_bins``. E.g. ``[2.0, 5.0, 9.0]`` → 4 bins.
+        ``priority_bins``. E.g. ``[2.0, 5.0, 9.0]`` -> 4 bins.
     weights : QUBOWeights | None
         Full weight override (ignores individual weight kwargs).
     preprocessing : PreprocessingConfig | None

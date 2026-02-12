@@ -1,4 +1,3 @@
-import pipeline
 from pipeline import run_pipeline
 import logging
 
