@@ -354,11 +354,15 @@ class ItineraryBuilder:
         if self.pp.same_cabin_only:
             return [pax.cabin_cd]
         cabin = pax.cabin_cd.upper()
-        if cabin == "Y":
-            # Y-class: no upgrade permitted
-            return ["Y"]
-        # C or F: own cabin or downgrade to Y
-        return [cabin, "Y"]
+        if self.pp.upgrade_allowed:
+            # Y, C: own cabin or downgrade/upgrade
+            return ["C", "Y"]
+        else:
+            if cabin == "Y":
+                # Y-class: no upgrade permitted
+                return ["Y"]
+            # C or F: own cabin or downgrade to Y
+            return [cabin, "Y"]
 
     def _check_capacity(self, flt: Flight, cabin: str, pax_cnt: int = 1) -> bool:
         """Return True only if this flight-cabin has genuine room for pax_cnt new pax.

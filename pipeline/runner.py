@@ -466,6 +466,7 @@ def run_pipeline(
     time_window_after: float = 6.0,
     time_window_fallback: Optional[List[float]] = None,
     same_cabin_only: bool = False,
+    upgrade_allowed: bool = False,
     max_qubo_vars: int = 5000,
     # --- multi-leg ---
     enable_multi_leg: bool = False,
@@ -580,6 +581,7 @@ def run_pipeline(
             time_window_after_hours=time_window_after,
             time_window_fallback_after_hours=time_window_fallback,
             same_cabin_only=same_cabin_only,
+            upgrade_allowed=upgrade_allowed,
             max_qubo_variables=max_qubo_vars,
             include_non_affected_passengers=include_non_affected,
             max_non_affected_passengers=max_non_affected,

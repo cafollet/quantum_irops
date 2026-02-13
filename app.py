@@ -9,6 +9,7 @@ import time
 import random
 import logging
 
+from pipeline.config import PreprocessingConfig
 from pipeline import run_pipeline
 from utils import get_data_frames, QueueHandler
 from post_analysis import run_post_analysis
@@ -20,6 +21,8 @@ all_pnrs = "./notebooks/data/PRMI_DM_ALL_PNRs.csv"
 df_affected_flights, df_available_flights, df_pnrs = get_data_frames(
     canceled_flights, available_flights, all_pnrs
 )
+
+T = 0.00
 
 ### Dashboard App ###
 
@@ -203,6 +206,8 @@ def run_optimization_task(params, msg_queue, shared_state):
     try:
         method = params["method"]
         batch_strategy = params["batch_strategy"]
+        num_bins = int(params["num_bins"])
+        upgrade_allowed = (params["upgrade_allowed"] == "Yes")
 
         queue_handler = QueueHandler(msg_queue)
         queue_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
@@ -215,8 +220,9 @@ def run_optimization_task(params, msg_queue, shared_state):
             "method": method,
             "cancelled": "notebooks/data/PRMI-DM_TARGET_FLIGHTS.csv",
             "available": "notebooks/data/PRMI-DM-AVAILABLE_FLIGHTS.csv",
+            "upgrade_allowed": upgrade_allowed,
             "batch_strategy": batch_strategy,
-            "priority_bins": 30,
+            "priority_bins": num_bins,
             "time_window_after": 72.0,
             "enable_multi_leg": True,
             "max_legs": 2,
@@ -226,11 +232,24 @@ def run_optimization_task(params, msg_queue, shared_state):
         }
 
         msg_queue.put(f"INFO: Starting {method} optimization...")
+
+        # Start time
+        t_0 = time.time()
+
         assignments, unbooked = run_pipeline(**kwargs)
+
+        # End time
+        t_1 = time.time()
+
+        global T
+
+        T = t_1 - t_0
 
         shared_state["result"] = (assignments, unbooked)
         shared_state["status"] = "done"
-        msg_queue.put("SUCCESS: Optimization Finished.")
+        msg_queue.put("SUCCESS: Optimization Finished in {}:{:2} minutes.".format(
+            int(T // 60), int(T % 60))
+        )
 
     except Exception as e:
         msg_queue.put(f"ERROR: {str(e)}")
@@ -266,6 +285,22 @@ with ui.card(full_screen=True, height="600px"):
                     "auto",
                 ],
                 selected="by_priority_tier",
+            )
+
+            ui.input_numeric(
+                "num_bins",
+                "Number of bins:",
+                30,
+                min=0,
+                max=100,
+                step=1,
+            )
+
+            ui.input_select(
+                "upgrade_allowed",
+                "Class Upgrade Allowed?",
+                choices=["Yes", "No"],
+                selected="No",
             )
 
             ui.br()
@@ -354,6 +389,8 @@ def start_optimization():
     params = {
         "method": input.opt_method(),
         "batch_strategy": input.batch_stg(),
+        "num_bins": input.num_bins(),
+        "upgrade_allowed": input.upgrade_allowed(),
     }
 
     t = threading.Thread(
@@ -402,7 +439,7 @@ def poll_background_thread():
         if status == "done":
             assignments, unbooked = s["result"]
             result_df.set(s["result"])
-            ui.notification_show("Optimization Complete! Running post-analysis...", type="message")
+            ui.notification_show("Optimization Complete in {}:{:2} minutes! Running post-analysis...".format(int((T) // 60), int((T) % 60)), type="message")
             # Run post-analysis on the in-memory DataFrames
             try:
                 report = run_post_analysis(

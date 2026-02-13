@@ -53,6 +53,7 @@ class PreprocessingConfig:
     time_window_after_hours: float = 6.0
     max_candidates_per_passenger: int = 50
     same_cabin_only: bool = False
+    upgrade_allowed: bool = False  # Enable upgrade allowing for Y class to C class
 
     # Require at least 1 available seats before a flight enters the
     # candidate pool.
@@ -76,7 +77,7 @@ class PreprocessingConfig:
     # When no candidates exist within the primary window, retry with these
     # progressively wider "after" horizons (hours).
     time_window_fallback_after_hours: List[float] = field(
-        default_factory=lambda: [12.0, 24.0, 48.0, 60.0]
+        default_factory=lambda: [72.0]
     )
 
     include_non_affected_passengers: bool = False
