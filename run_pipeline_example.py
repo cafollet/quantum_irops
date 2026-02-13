@@ -23,4 +23,8 @@ assignments, unbooked = run_pipeline(
 )
 
 t_1 = time.time()
-logging.info("Finished in {}:{} minutes".format(int((t_1 - t_0)//60), int((t_1 - t_0)%60)))
+logging.info(
+    "Finished in {} minutes {} seconds".format(
+        int((t_1 - t_0) // 60), int((t_1 - t_0) % 60)
+    )
+)

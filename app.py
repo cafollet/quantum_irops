@@ -207,7 +207,7 @@ def run_optimization_task(params, msg_queue, shared_state):
         method = params["method"]
         batch_strategy = params["batch_strategy"]
         num_bins = int(params["num_bins"])
-        upgrade_allowed = (params["upgrade_allowed"] == "Yes")
+        upgrade_allowed = params["upgrade_allowed"] == "Yes"
 
         queue_handler = QueueHandler(msg_queue)
         queue_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
@@ -247,8 +247,10 @@ def run_optimization_task(params, msg_queue, shared_state):
 
         shared_state["result"] = (assignments, unbooked)
         shared_state["status"] = "done"
-        msg_queue.put("SUCCESS: Optimization Finished in {}:{:2} minutes.".format(
-            int(T // 60), int(T % 60))
+        msg_queue.put(
+            "SUCCESS: Optimization Finished in {} minutes and {} seconds.".format(
+                int(T // 60), int(T % 60)
+            )
         )
 
     except Exception as e:
@@ -439,7 +441,12 @@ def poll_background_thread():
         if status == "done":
             assignments, unbooked = s["result"]
             result_df.set(s["result"])
-            ui.notification_show("Optimization Complete in {}:{:2} minutes! Running post-analysis...".format(int((T) // 60), int((T) % 60)), type="message")
+            ui.notification_show(
+                "Optimization Complete in {} minutes and {} seconds! Running post-analysis...".format(
+                    int((T) // 60), int((T) % 60)
+                ),
+                type="message",
+            )
             # Run post-analysis on the in-memory DataFrames
             try:
                 report = run_post_analysis(
