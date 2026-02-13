@@ -42,6 +42,15 @@ DATETIME_FMTS = [
     "%Y-%m-%d",
 ]
 
+# CVM priority tiers — boundaries chosen to reflect Copa's CVM scale (0-~13)
+# Higher CVM = higher-value passenger = should be reassigned first.
+CVM_TIERS = [
+    ("Low",     0,   3),
+    ("Medium",  3,   6),
+    ("High",    6,   9),
+    ("Premium", 9,   float("inf")),
+]
+
 ASGN_REQUIRED = [
     "ALT_DEP_KEY", "ALT_CABIN_CD", "PAX_CNT",
     "ORIG_CD", "DEST_CD", "ALT_ORIG_CD", "ALT_DEST_CD",
@@ -83,7 +92,7 @@ def _parse_dt(series: pd.Series) -> pd.Series:
 
 
 def _delay_score(h: float) -> int:
-    """Score based on delay hours.  h <= 0 (early/on-time) → best score."""
+    """Score based on delay hours.  h <= 0 (early/on-time) -> best score."""
     if h <= 0:
         return DELAY_BANDS[0][1]
     if h > MAX_DELAY_HRS:
@@ -174,7 +183,7 @@ def _annotate_overbooking(df: pd.DataFrame, ob: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# 2. Rule Set 1 – flight quality scoring
+# 2. Rule Set 1 - flight quality scoring
 # ---------------------------------------------------------------------------
 
 def _score_flight_quality(df: pd.DataFrame) -> pd.DataFrame:
@@ -219,7 +228,7 @@ def _score_flight_quality(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# 3. Rule Set 3 – cabin compliance
+# 3. Rule Set 3 - cabin compliance
 # ---------------------------------------------------------------------------
 
 def _score_cabin_compliance(df: pd.DataFrame) -> pd.DataFrame:
@@ -270,10 +279,40 @@ def _classify_journey(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# CVM tier breakdown (PAX_CNT-weighted so multi-pax PNRs count correctly)
+# ---------------------------------------------------------------------------
+
+def _cvm_tier_rows(df_assigned, df_unbooked):
+    """Return one dict per CVM tier with reassignment counts and rate."""
+    rows = []
+    for name, lo, hi in CVM_TIERS:
+        a_mask = (df_assigned["CVM"] >= lo) & (df_assigned["CVM"] < hi)
+        a_pax = int(df_assigned.loc[a_mask, "PAX_CNT"].sum())
+        if df_unbooked is not None and len(df_unbooked):
+            u_mask = (df_unbooked["CVM"] >= lo) & (df_unbooked["CVM"] < hi)
+            u_pax = int(df_unbooked.loc[u_mask, "PAX_CNT"].sum())
+        else:
+            u_pax = 0
+        total = a_pax + u_pax
+        rows.append(
+            {
+                "tier": name,
+                "lo": lo,
+                "hi": hi,
+                "assigned": a_pax,
+                "unbooked": u_pax,
+                "total": total,
+                "rate": 100.0 * a_pax / total if total else 0.0,
+            }
+        )
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # Aggregate metrics
 # ---------------------------------------------------------------------------
 
-def _compute_metrics(df: pd.DataFrame, ob: pd.DataFrame, unbooked) -> dict:
+def _compute_metrics(df, ob, unbooked):
     n_asgn = int(df["PAX_CNT"].sum()) if "PAX_CNT" in df.columns else len(df)
     n_unb = (
         int(unbooked["PAX_CNT"].sum())
@@ -295,6 +334,17 @@ def _compute_metrics(df: pd.DataFrame, ob: pd.DataFrame, unbooked) -> dict:
     n_ob = int(ob["is_overbooked"].sum())
     seats_ob = int(ob["overbooked_by"].sum())
 
+    # PAX-weighted mean CVM: headline check that priority ordering is working
+    wtd_cvm_asgn = float(
+        (df["CVM"] * df["PAX_CNT"]).sum() / df["PAX_CNT"].sum()
+    ) if "CVM" in df.columns and df["PAX_CNT"].sum() > 0 else np.nan
+    wtd_cvm_unb = float(
+        (unbooked["CVM"] * unbooked["PAX_CNT"]).sum() / unbooked["PAX_CNT"].sum()
+    ) if (
+        unbooked is not None and len(unbooked)
+        and "CVM" in unbooked.columns and unbooked["PAX_CNT"].sum() > 0
+    ) else np.nan
+
     return {
         "n_assigned": n_asgn,
         "n_unbooked": n_unb,
@@ -315,6 +365,8 @@ def _compute_metrics(df: pd.DataFrame, ob: pd.DataFrame, unbooked) -> dict:
         "pct_ob_flights": 100 * n_ob / len(ob) if len(ob) else 0,
         "max_util": float(ob["util_pct"].max()) if len(ob) else 0,
         "n_flights_total": len(ob),
+        "wtd_cvm_assigned": wtd_cvm_asgn,
+        "wtd_cvm_unbooked": wtd_cvm_unb,
     }
 
 
@@ -322,7 +374,7 @@ def _compute_metrics(df: pd.DataFrame, ob: pd.DataFrame, unbooked) -> dict:
 # Text report builder
 # ---------------------------------------------------------------------------
 
-def _format_report(df: pd.DataFrame, ob: pd.DataFrame, m: dict) -> str:
+def _format_report(df, ob, m, unb=None):
     buf = io.StringIO()
     w = buf.write
     SEP = "=" * 72
@@ -332,40 +384,65 @@ def _format_report(df: pd.DataFrame, ob: pd.DataFrame, m: dict) -> str:
     w("  RE-ACCOMMODATION QUALITY REPORT  (Phase 2 Rules Set)\n")
     w(f"{SEP}\n")
 
-    # --- Overbooking summary ---
-    any_ob = m["n_ob_flights"] > 0
-    if any_ob:
-        w(f"\n  *** OVERBOOKING DETECTED ***\n")
+    # --- Headline: passenger reassignment rate (individual people, not PNRs) ---
+    w(f"\n  {'Passengers reassigned':<30}: {m['n_assigned']:,} / {m['total']:,}")
+    w(f"  ({m['reaccom_pct']:.1f}%)\n")
+    w(f"  {'Passengers still unbooked':<30}: {m['n_unbooked']:,}\n")
+
+    # --- Overbooking summary (counts only, no per-flight table) ---
+    w(f"\n  {'Flight-cabin pairs checked':<30}: {m['n_flights_total']}\n")
+    w(f"  {'Overbooked pairs':<30}: {m['n_ob_flights']}\n")
+    w(f"  {'Total seats over AUL':<30}: {m['seats_overbooked']}\n")
+    w(f"  {'Peak utilisation':<30}: {m['max_util']:.0f}%\n")
+    if m["n_ob_flights"] > 0:
         w(
-            f"      {m['n_ob_flights']} of {m['n_flights_total']}"
-            " flight-cabin pairs exceed authorised load\n"
+            f"\n  *** OVERBOOKING DETECTED — {m['n_ob_flights']} of"
+            f" {m['n_flights_total']} pairs exceed authorised load ***\n"
         )
-        w(f"      {m['seats_overbooked']} seats assigned beyond capacity\n")
-        w(f"      Peak utilisation: {m['max_util']:.0f}%\n")
     else:
         w(f"\n  OK  All {m['n_flights_total']} flight-cabin pairs within authorised load\n")
 
-    # --- Capacity summary (overbooked flights only) ---
-    w(f"\n  Flight-cabin pairs checked : {m['n_flights_total']}\n")
-    w(f"  Overbooked pairs           : {m['n_ob_flights']}\n")
-    w(f"  Total seats over AUL       : {m['seats_overbooked']}\n")
-    w(f"  Peak utilisation           : {m['max_util']:.0f}%\n")
-    if any_ob:
-        ob_rows = ob[ob["is_overbooked"]].reset_index(drop=True)
-        w(f"\n  {'Flight (Cabin)':<46} {'New':>5} {'AUL':>5} {'Total':>6} {'Over':>6} {'Util%':>6}\n")
-        w("  " + "-" * 72 + "\n")
-        for _, r in ob_rows.iterrows():
-            lbl = f"{_short_key(r['ALT_DEP_KEY'])} ({r['ALT_CABIN_CD']})"
-            w(
-                f"   {lbl:<46} {r['new_pax']:>5} {r['aul']:>5}"
-                f" {r['total_after']:>6} +{r['overbooked_by']:<5} {r['util_pct']:>5.0f}%\n"
+    # --- CVM priority breakdown ---
+    w(f"\n  {THIN}\n")
+    w("  REASSIGNMENT BY CVM TIER  (higher CVM = higher priority)\n")
+    w(f"  {THIN}\n")
+
+    # Headline delta: are higher-value passengers actually getting seats first?
+    if not np.isnan(m["wtd_cvm_assigned"]):
+        w(f"  Mean CVM assigned : {m['wtd_cvm_assigned']:.2f}")
+        if not np.isnan(m["wtd_cvm_unbooked"]):
+            delta = m["wtd_cvm_assigned"] - m["wtd_cvm_unbooked"]
+            sign = "+" if delta >= 0 else ""
+            verdict = (
+                "priority ordering OK"
+                if delta > 0
+                else "WARNING: lower-value pax favoured"
             )
+            w(
+                f"  |  unbooked : {m['wtd_cvm_unbooked']:.2f}"
+                f"  |  delta {sign}{delta:.2f}  ({verdict})\n"
+            )
+        else:
+            w("\n")
+
+    w(
+        f"\n  {'Tier':<10} {'CVM range':<12} {'Assigned':>10}"
+        f" {'Unbooked':>10} {'Total':>8} {'Rate':>7}  Bar\n"
+    )
+    w("  " + "-" * 64 + "\n")
+    for t in _cvm_tier_rows(df, unb):
+        hi_str = f"{int(t['hi'])}" if t["hi"] != float("inf") else "+"
+        rng = f"{int(t['lo'])}-{hi_str}"
+        bar = "#" * int(t["rate"] / 5)  # one # per 5 %
+        w(
+            f"  {t['tier']:<10} {rng:<12} {t['assigned']:>10,}"
+            f" {t['unbooked']:>10,} {t['total']:>8,} {t['rate']:>6.1f}%  {bar}\n"
+        )
 
     # --- Rule Set 4: solution ranking ---
     w(f"\n  {THIN}\n")
     w("  SOLUTION RANKING  (Rule Set 4)\n")
     w(f"  {THIN}\n")
-    w(f"  Re-accommodation rate : {m['reaccom_pct']:.1f}%  ({m['n_assigned']:,} / {m['total']:,} pax)\n")
     w(f"  Mean arrival delay    : {m['mean_arr_delay']:.2f} h  (median {m['median_arr_delay']:.2f} h)\n")
     if not np.isnan(m["wtd_arr_delay"]):
         w(f"  CVM-weighted delay    : {m['wtd_arr_delay']:.2f} h\n")
@@ -386,7 +463,6 @@ def _format_report(df: pd.DataFrame, ob: pd.DataFrame, m: dict) -> str:
         w(f"    {g}: {cnt:6d}  ({pct:5.1f}%)  {bar}\n")
     w(f"  Ineligible (>72 h)    : {m['ineligible']}\n")
 
-    # --- Score component breakdown ---
     w(f"\n  Score components (mean pts per leg):\n")
     w(f"    Arrival delay  : {df['score_arr_delay'].mean():6.1f}\n")
     w(f"    Departure delay: {df['score_dep_delay'].mean():6.1f}\n")
@@ -430,11 +506,7 @@ def _format_report(df: pd.DataFrame, ob: pd.DataFrame, m: dict) -> str:
 # Public API
 # ---------------------------------------------------------------------------
 
-def run_post_analysis(
-    assignments_df,
-    unbooked_df,
-    available_flights,
-) -> str:
+def run_post_analysis(assignments_df, unbooked_df, available_flights):
     """Run the full Phase-2 rule-set analysis and return a text report.
 
     Parameters
@@ -452,7 +524,7 @@ def run_post_analysis(
     str
         Formatted multi-line report.
     """
-    # --- Normalise inputs to pandas ---
+    # Normalise inputs to pandas
     df = _to_pandas(assignments_df)
     df = _strip_cols(df)
 
@@ -467,7 +539,7 @@ def run_post_analysis(
     else:
         avail = _strip_cols(_to_pandas(available_flights))
 
-    # Validate
+    # Validate required columns
     missing_asgn = [c for c in ASGN_REQUIRED if c not in df.columns]
     missing_avail = [c for c in AVAIL_REQUIRED if c not in avail.columns]
     if missing_asgn or missing_avail:
@@ -483,7 +555,7 @@ def run_post_analysis(
         if col in df.columns:
             df[col] = _parse_dt(df[col])
 
-    # Run pipeline
+    # Run scoring pipeline
     ob = _check_overbooking(df, avail)
     df = _annotate_overbooking(df, ob)
     df = _score_flight_quality(df)
@@ -491,4 +563,4 @@ def run_post_analysis(
     df = _classify_journey(df)
     m = _compute_metrics(df, ob, unb)
 
-    return _format_report(df, ob, m)
+    return _format_report(df, ob, m, unb)
