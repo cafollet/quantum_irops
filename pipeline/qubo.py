@@ -202,14 +202,15 @@ class QUBOFormulator:
     # OBJECTIVE: unbooked penalty
 
     def _add_unbooked_penalty(self):
+        """Penalise leaving an affected passenger unbooked.
+        """
         for i, pax in enumerate(self.passengers):
             si = self.var_map[("slack", i)]
             if pax.is_affected:
-                mult = 1.0 + self.w.cvm_priority_weight * pax.cvm
                 self._add_to_Q(
                     si,
                     si,
-                    self.w.unbooked_passenger_penalty * pax.pax_cnt * mult,
+                    self.w.unbooked_passenger_penalty * pax.pax_cnt,
                 )
 
     # OBJECTIVE: time change

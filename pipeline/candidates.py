@@ -152,7 +152,7 @@ class ItineraryBuilder:
                         continue
                 cabins = self._get_candidate_cabins(pax, flt)
                 for cabin in cabins:
-                    if self._check_capacity(flt, cabin):
+                    if self._check_capacity(flt, cabin, pax.pax_cnt):
                         itineraries.append(Itinerary(legs=((j, cabin),)))
             if itineraries:
                 if after_hrs is not None and after_hrs > self.pp.time_window_after_hours:
@@ -212,8 +212,8 @@ class ItineraryBuilder:
                         for c1 in self._get_candidate_cabins(pax, flt1):
                             for c2 in self._get_candidate_cabins(pax, flt2):
                                 if self._check_capacity(
-                                    flt1, c1
-                                ) and self._check_capacity(flt2, c2):
+                                    flt1, c1, pax.pax_cnt
+                                ) and self._check_capacity(flt2, c2, pax.pax_cnt):
                                     itineraries.append(
                                         Itinerary(legs=((j1, c1), (j2, c2)))
                                     )
@@ -279,9 +279,9 @@ class ItineraryBuilder:
                                     continue
                             cabin = pax.cabin_cd
                             if (
-                                self._check_capacity(flt1, cabin)
-                                and self._check_capacity(flt2, cabin)
-                                and self._check_capacity(flt3, cabin)
+                                self._check_capacity(flt1, cabin, pax.pax_cnt)
+                                and self._check_capacity(flt2, cabin, pax.pax_cnt)
+                                and self._check_capacity(flt3, cabin, pax.pax_cnt)
                             ):
                                 itineraries.append(
                                     Itinerary(
@@ -360,11 +360,12 @@ class ItineraryBuilder:
         # C or F: own cabin or downgrade to Y
         return [cabin, "Y"]
 
-    def _check_capacity(self, flt: Flight, cabin: str) -> bool:
-        """Return True only if this flight-cabin has genuine room for new pax.
+    def _check_capacity(self, flt: Flight, cabin: str, pax_cnt: int = 1) -> bool:
+        """Return True only if this flight-cabin has genuine room for pax_cnt new pax.
         """
+        needed = max(self.pp.min_available_seats, pax_cnt)
         avail = flt.available_seats(cabin)
-        if avail >= self.pp.min_available_seats:
+        if avail >= needed:
             return True
         if self.w.overbooking_allowed and self.w.overbooking_limit_fraction > 0:
             aul = flt.c_aul_cnt if cabin == "C" else flt.y_aul_cnt
@@ -372,7 +373,7 @@ class ItineraryBuilder:
             if buffer == 0:
                 return False
             current = flt.c_pax_cnt if cabin == "C" else flt.y_pax_cnt
-            return current < aul + buffer
+            return current + pax_cnt <= aul + buffer
         return False
 
     def _top_k_itineraries(
@@ -431,6 +432,30 @@ class PreprocessingEngine:
         self.w = weights
         self.itinerary_builder: Optional[ItineraryBuilder] = None
         self.stats: dict = {}
+
+    def rebuild_batch_itineraries(self, batch: dict, updated_flights: List) -> None:
+        """Rebuild itinerary candidates for one batch using current flight capacity.
+
+        Mutates batch["itineraries"] in place.  Flight indices (j) are stable
+        across update_flights() calls so QUBO variable mappings remain valid.
+        """
+        builder = ItineraryBuilder(
+            flights=updated_flights,
+            ml_config=self.cfg.multi_leg,
+            pp_config=self.cfg,
+            weights=self.w,
+        )
+        old_count = sum(len(v) for v in batch["itineraries"].values())
+        new_itins = builder.build_itineraries(batch["passengers"])
+        new_count = sum(len(v) for v in new_itins.values())
+        pruned = old_count - new_count
+        if pruned > 0:
+            logger.info(
+                "Batch %s: pruned %d stale itinerary candidates (%d → %d) "
+                "after capacity update",
+                batch.get("batch_id", "?"), pruned, old_count, new_count,
+            )
+        batch["itineraries"] = new_itins
 
     def prepare(self) -> List[dict]:
         passengers = self._select_passengers()

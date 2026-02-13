@@ -11,6 +11,10 @@ assignments, unbooked = run_pipeline(
     available="notebooks/data/PRMI-DM-AVAILABLE_FLIGHTS.csv",
     batch_strategy="by_priority_tier",
     priority_bins=30,
+    time_window_after=72.0,
+    enable_multi_leg=True,
+    max_legs=2,
+    max_passes=2,
     output_unbooked="output_files/priority_batch_unbooked_updated.csv",
     output_assignments="output_files/priority_batch_results_updated.csv",
 )

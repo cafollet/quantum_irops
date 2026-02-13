@@ -36,6 +36,9 @@ class ReaccommodationPipeline:
         self.batch_results: list = []
         self.all_assignments: Optional[pd.DataFrame] = None
         self.all_unbooked: Optional[pd.DataFrame] = None
+        self._original_affected_pax: int = 0
+        self._pass_stats: list = []
+        self._final_flights = None
 
     @staticmethod
     def _to_dataframe(src, name: str) -> pd.DataFrame:
@@ -56,18 +59,28 @@ class ReaccommodationPipeline:
         target_csv,
         available_csv,
         method: str = "sa",
+        max_passes: int = 1,
         **solver_kwargs,
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Run the full re-accommodation pipeline.
+        """Run the full re-accommodation pipeline, optionally iterating over
+        unbooked passengers with updated flight capacity.
 
         Parameters
         ----------
-        pnr_csv : str | Path | pd.DataFrame
-        target_csv : str | Path | pd.DataFrame
-        available_csv : str | Path | pd.DataFrame
+        pnr_csv, target_csv, available_csv : str | Path | pd.DataFrame
         method : {'sa', 'neal', 'dwave'}
+        max_passes : int
+            Maximum number of full solve-cycles.  Each pass takes the
+            passengers left unbooked by the previous pass and re-runs them
+            against the remaining flight capacity.
+            Stops early when no new assignments are found or all passengers
+            are placed.
         **solver_kwargs : passed through to the chosen solver backend.
         """
+        # Reset per-run state
+        self._pass_stats = []
+        self._final_flights = None
+
         logger.info("Loading input data...")
         pnr_df = self._to_dataframe(pnr_csv, "pnr_csv")
         target_df = self._to_dataframe(target_csv, "target_csv")
@@ -81,12 +94,119 @@ class ReaccommodationPipeline:
                 self.pp_config.multi_leg.max_legs,
             )
 
+        # Store for summary()
+        self._original_affected_pax = sum(
+            p.pax_cnt for p in self.processor.affected_passengers
+        )
+
+        # Accumulate assignments across passes
+        # unbooked tracks whos still waiting after pass
+        accumulated_assignments: List[pd.DataFrame] = []
+        last_unbooked: pd.DataFrame = pd.DataFrame()
+
+        for pass_num in range(1, max_passes + 1):
+            n_remaining = len(self.processor.affected_passengers)
+            if n_remaining == 0:
+                logger.info("Pass %d: no passengers remaining — done.", pass_num)
+                break
+
+            logger.info(
+                "\n========== PASS %d / %d  —  %d segments (%d PAX) ==========",
+                pass_num,
+                max_passes,
+                n_remaining,
+                sum(p.pax_cnt for p in self.processor.affected_passengers),
+            )
+
+            cap_tracker = CapacityTracker(self.processor.available_flights)
+
+            pass_assignments, pass_unbooked = self._run_pass(
+                cap_tracker, method, **solver_kwargs
+            )
+
+            n_new = (
+                pass_assignments[_PNR_KEY].drop_duplicates().shape[0]
+                if len(pass_assignments)
+                else 0
+            )
+            n_new_pax = (
+                int(pass_assignments["PAX_CNT"].sum())
+                if len(pass_assignments) and "PAX_CNT" in pass_assignments.columns
+                else 0
+            )
+            n_still_unbooked = (
+                int(pass_unbooked["PAX_CNT"].sum())
+                if len(pass_unbooked) and "PAX_CNT" in pass_unbooked.columns
+                else len(pass_unbooked)
+            )
+            cumulative_assigned = sum(s["assigned_pax"] for s in self._pass_stats) + n_new_pax
+            self._pass_stats.append({
+                "pass": pass_num,
+                "segments_in": n_remaining,
+                "assigned_segments": n_new,
+                "assigned_pax": n_new_pax,
+                "unbooked_pax": n_still_unbooked,
+                "cumulative_pax": cumulative_assigned,
+            })
+            logger.info(
+                "Pass %d: %d new segment(s) assigned, %d still unbooked",
+                pass_num,
+                n_new,
+                len(pass_unbooked) if len(pass_unbooked) else 0,
+            )
+
+            if n_new == 0:
+                logger.info(
+                    "No new assignments in pass %d — stopping early.", pass_num
+                )
+                last_unbooked = pass_unbooked
+                break
+
+            accumulated_assignments.append(pass_assignments)
+            last_unbooked = pass_unbooked
+
+            if pass_num < max_passes and len(pass_unbooked):
+                # Update available_flights
+                self.processor.available_flights = cap_tracker.update_flights(
+                    self.processor.available_flights
+                )
+                # still-unbooked passengers
+                unbooked_keys = set(
+                    zip(pass_unbooked["RECLOC"], pass_unbooked["DEP_KEY"])
+                )
+                self.processor.affected_passengers = [
+                    p
+                    for p in self.processor.affected_passengers
+                    if (p.recloc, p.dep_key) in unbooked_keys
+                ]
+
+        if accumulated_assignments:
+            combined = pd.concat(accumulated_assignments, ignore_index=True)
+            # Defensive dedup: keep first assignment per (RECLOC, DEP_KEY)
+            self.all_assignments = combined.drop_duplicates(
+                subset=_PNR_KEY, keep="first"
+            ).reset_index(drop=True)
+        else:
+            self.all_assignments = pd.DataFrame()
+
+        self.all_unbooked = last_unbooked
+        self._final_flights = list(self.processor.available_flights)
+
+        return self.all_assignments, self.all_unbooked
+
+    def _run_pass(
+        self,
+        cap_tracker: CapacityTracker,
+        method: str,
+        **solver_kwargs,
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Run one full prepare→batch→solve cycle.
+        """
         self.preprocessor = PreprocessingEngine(
             self.processor, self.pp_config, self.weights
         )
         batches = self.preprocessor.prepare()
 
-        cap_tracker = CapacityTracker(self.processor.available_flights)
         dep_key_to_idx = {
             f.dep_key: j for j, f in enumerate(self.processor.available_flights)
         }
@@ -98,6 +218,8 @@ class ReaccommodationPipeline:
             batch["flights"] = cap_tracker.update_flights(
                 self.processor.available_flights
             )
+
+            self.preprocessor.rebuild_batch_itineraries(batch, batch["flights"])
 
             formulator = QUBOFormulator(
                 passengers=batch["passengers"],
@@ -129,10 +251,6 @@ class ReaccommodationPipeline:
             adf, udf = interpreter.interpret(sol)
             self.batch_results.append((adf, udf))
 
-            # Update capacity.  Guard with composite (RECLOC, DEP_KEY, alt_dep_key,
-            # cabin) so two different segments of the same RECLOC going to the
-            # same alt flight each correctly consume their own seats, but a
-            # single segment is never double-counted.
             if len(adf):
                 seen_segment_flight: set = set()
                 for _, row in adf.iterrows():
@@ -143,7 +261,7 @@ class ReaccommodationPipeline:
                     if flt_idx is not None and cabin and pax_cnt:
                         key = (
                             row.get("RECLOC"),
-                            row.get("DEP_KEY"),   # original segment key
+                            row.get("DEP_KEY"),
                             alt_dep_key,
                             cabin,
                         )
@@ -151,32 +269,31 @@ class ReaccommodationPipeline:
                             seen_segment_flight.add(key)
                             cap_tracker.consume(flt_idx, cabin, int(pax_cnt))
 
-        self._merge_results()
-        return self.all_assignments, self.all_unbooked
+        return self._merge_pass_results()
 
-    def _merge_results(self):
+    def _merge_pass_results(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Merge batch_results for the current pass into single DataFrames."""
         all_a = [a for a, _ in self.batch_results if len(a)]
         all_u = [u for _, u in self.batch_results if len(u)]
 
-        self.all_assignments = (
+        assignments = (
             pd.concat(all_a, ignore_index=True) if all_a else pd.DataFrame()
         )
-        self.all_unbooked = (
+        unbooked = (
             pd.concat(all_u, ignore_index=True) if all_u else pd.DataFrame()
         )
 
-        if len(self.all_assignments):
-            if "_itin_id" in self.all_assignments.columns:
-                # For each (RECLOC, DEP_KEY) segment keep only the rows that
-                # belong to the FIRST itinerary assigned (highest-priority
-                # batch).  All alternate legs of a multi-leg itinerary share
-                # the same _itin_id so they are kept together.
+        if len(assignments):
+            if "_itin_id" in assignments.columns:
+                # Keep only the first itinerary per (RECLOC, DEP_KEY) segment
                 first_itin = (
-                    self.all_assignments
-                    .drop_duplicates(subset=_PNR_KEY, keep="first")[_PNR_KEY + ["_itin_id"]]
+                    assignments
+                    .drop_duplicates(subset=_PNR_KEY, keep="first")[
+                        _PNR_KEY + ["_itin_id"]
+                    ]
                     .rename(columns={"_itin_id": "_first_itin_id"})
                 )
-                merged = self.all_assignments.merge(first_itin, on=_PNR_KEY, how="left")
+                merged = assignments.merge(first_itin, on=_PNR_KEY, how="left")
                 mask = merged["_itin_id"] == merged["_first_itin_id"]
                 dropped = int((~mask).sum())
                 if dropped:
@@ -185,44 +302,88 @@ class ReaccommodationPipeline:
                         "(solver constraint violations or cross-batch duplicates).",
                         dropped,
                     )
-                self.all_assignments = (
-                    self.all_assignments[mask]
+                assignments = (
+                    assignments[mask]
                     .drop(columns=["_itin_id"])
                     .reset_index(drop=True)
                 )
             else:
-                # Fallback for DataFrames that pre-date the _itin_id field.
-                self.all_assignments = self.all_assignments.drop_duplicates(
+                assignments = assignments.drop_duplicates(
                     subset=_PNR_KEY + ["ALT_DEP_KEY", "ALT_CABIN_CD"],
                     keep="first",
                 )
 
-        # Remove from unbooked any segment that was successfully assigned.
-        # Match on (RECLOC, DEP_KEY) so a passenger with two affected legs
-        # is only marked fully booked when BOTH legs have assignments.
-        if len(self.all_unbooked) and len(self.all_assignments):
-            booked_segments = self.all_assignments[_PNR_KEY].drop_duplicates()
-            self.all_unbooked = (
-                self.all_unbooked
-                .merge(booked_segments.assign(_booked=True), on=_PNR_KEY, how="left")
-                .pipe(lambda df: df[df["_booked"].isna()])
-                .drop(columns=["_booked"])
+        if len(unbooked) and len(assignments):
+            booked = assignments[_PNR_KEY].drop_duplicates()
+            unbooked = (
+                unbooked
+                .merge(booked.assign(_b=True), on=_PNR_KEY, how="left")
+                .pipe(lambda df: df[df["_b"].isna()])
+                .drop(columns=["_b"])
                 .reset_index(drop=True)
             )
 
+        return assignments, unbooked
+
+    def export_remaining_flights(self, path: Optional[str] = None) -> pd.DataFrame:
+        """Return (and optionally save) the available-flights CSV with updated
+        seat counts reflecting everything consumed during this run.
+
+        The returned DataFrame has the same schema as the original
+        available_csv so it can be fed directly as ``available`` to a future
+        ``run()`` call, enabling external persistence / resume.
+
+        Parameters
+        ----------
+        path : str | None
+            If given, the DataFrame is also written to this CSV path.
+        """
+        if self._final_flights is None:
+            raise RuntimeError(
+                "No flight data to export — call run() first."
+            )
+        rows = []
+        for f in self._final_flights:
+            rows.append({
+                "DEP_KEY": f.dep_key,
+                "DEP_DT": f.dep_dt,
+                "ORIG_CD": f.orig_cd,
+                "DEST_CD": f.dest_cd,
+                "FLT_NUM": f.flt_num,
+                "DEP_DTML": f.dep_dtml,
+                "ARR_DTML": f.arr_dtml,
+                "DEP_DTMZ": f.dep_dtmz,
+                "ARR_DTMZ": f.arr_dtmz,
+                "C_CAP_CNT": f.c_cap_cnt,
+                "C_AUL_CNT": f.c_aul_cnt,
+                "C_PAX_CNT": f.c_pax_cnt,
+                "C_AVAIL_CNT": f.c_avail_cnt,
+                "Y_CAP_CNT": f.y_cap_cnt,
+                "Y_AUL_CNT": f.y_aul_cnt,
+                "Y_PAX_CNT": f.y_pax_cnt,
+                "Y_AVAIL_CNT": f.y_avail_cnt,
+            })
+        df = pd.DataFrame(rows)
+        if path:
+            df.to_csv(path, index=False)
+            logger.info("Remaining flight capacity written to %s", path)
+        return df
+
     def summary(self):
-        total_pax = sum(p.pax_cnt for p in self.processor.affected_passengers)
+        total_pax = self._original_affected_pax
         booked = 0
         if (
             self.all_assignments is not None
             and len(self.all_assignments)
             and "IS_AFFECTED" in self.all_assignments.columns
         ):
-            booked = self.all_assignments[self.all_assignments["IS_AFFECTED"]][
-                "PAX_CNT"
-            ].sum()
+            booked = int(
+                self.all_assignments[self.all_assignments["IS_AFFECTED"]][
+                    "PAX_CNT"
+                ].sum()
+            )
 
-        unbooked = (
+        unbooked = int(
             self.all_unbooked["PAX_CNT"].sum()
             if self.all_unbooked is not None and len(self.all_unbooked)
             else 0
@@ -231,15 +392,27 @@ class ReaccommodationPipeline:
         print("\n" + "=" * 70)
         print("RE-ACCOMMODATION SUMMARY")
         print("=" * 70)
-        print(f"  Total affected passengers:        {total_pax}")
-        print(f"  Successfully re-accommodated:     {booked}")
-        print(f"  Left unbooked:                    {unbooked}")
+        print(f"  Total affected passengers:        {total_pax:,}")
+        print(f"  Successfully re-accommodated:     {booked:,}")
+        print(f"  Left unbooked:                    {unbooked:,}")
         print(f"  Rate:                             {booked / max(total_pax, 1) * 100:.1f}%")
-        print(f"  Batches solved:                   {len(self.batch_results)}")
+        print(f"  Batches solved (last pass):       {len(self.batch_results)}")
+
+        if self._pass_stats:
+            print(f"\n  Per-pass breakdown:")
+            print(f"    {'Pass':<6} {'Segs in':>9} {'New segs':>10} {'New PAX':>9} {'Unbooked':>10} {'Cumul PAX':>11} {'Rate':>7}")
+            print(f"    {'-'*60}")
+            for s in self._pass_stats:
+                rate = s["cumulative_pax"] / max(total_pax, 1) * 100
+                print(
+                    f"    {s['pass']:<6} {s['segments_in']:>9,} {s['assigned_segments']:>10,} "
+                    f"{s['assigned_pax']:>9,} {s['unbooked_pax']:>10,} "
+                    f"{s['cumulative_pax']:>11,} {rate:>6.1f}%"
+                )
 
         if self.preprocessor:
             s = self.preprocessor.get_stats()
-            print(f"\n  Preprocessing:")
+            print(f"\n  Preprocessing (last pass):")
             print(f"    Strategy:                       {s.get('batch_strategy', 'N/A')}")
             print(f"    Direct itineraries:             {s.get('direct_itineraries', 0)}")
             print(f"    Multi-leg itineraries:          {s.get('multi_leg_itineraries', 0)}")
@@ -247,7 +420,7 @@ class ReaccommodationPipeline:
             print(f"    Pax with no options:            {s.get('passengers_with_no_options', 0)}")
             print(f"    Estimated QUBO vars:            {s.get('estimated_total_vars', 0)}")
             if s.get("priority_tier_info"):
-                print(f"\n  Priority Tier Breakdown (highest -> lowest CVM):")
+                print(f"\n  Priority Tier Breakdown (last pass, highest → lowest CVM):")
                 for t in s["priority_tier_info"]:
                     print(
                         f"    {t['label']}  CVM [{t['cvm_lo']:.3f}, {t['cvm_hi']:.3f}]"
@@ -256,19 +429,21 @@ class ReaccommodationPipeline:
 
         if self.all_assignments is not None and len(self.all_assignments):
             a = self.all_assignments
-            print(f"\n  Assignment Quality:")
+            print(f"\n  Assignment Quality (all passes combined):")
             direct = a[a["IS_DIRECT"]].shape[0] if "IS_DIRECT" in a else 0
             multi = a[~a["IS_DIRECT"]].shape[0] if "IS_DIRECT" in a else 0
-            print(f"    Direct assignments:             {direct}")
-            print(f"    Multi-leg assignments:          {multi}")
+            print(f"    Direct assignments:             {direct:,}")
+            print(f"    Multi-leg assignments:          {multi:,}")
             if "DEP_CHANGE_MINS" in a:
-                print(f"    Avg departure shift (mins):     {a['DEP_CHANGE_MINS'].mean():.0f}")
-            if "ITINERARY_CABINS" in a:
+                print(
+                    f"    Avg departure shift (mins):     {a['DEP_CHANGE_MINS'].mean():.0f}"
+                )
+            if "ITINERARY_CABINS" in a and "ORIG_CABIN" in a:
                 cabin_changed = a[a["ORIG_CABIN"] != a["ITINERARY_CABINS"]].shape[0]
-                print(f"    Cabin class changes:            {cabin_changed}")
+                print(f"    Cabin class changes:            {cabin_changed:,}")
             if "IS_AFFECTED" in a:
                 non_aff = a[~a["IS_AFFECTED"]].shape[0]
-                print(f"    Non-affected moved:             {non_aff}")
+                print(f"    Non-affected moved:             {non_aff:,}")
 
         print("=" * 70)
 
@@ -283,6 +458,7 @@ def run_pipeline(
     t_init: float = 200.0,
     alpha: float = 0.998,
     seed: int = 42,
+    max_passes: int = 1,
     # --- preprocessing ---
     filter_level: str = "moderate",
     batch_strategy: str = "auto",
@@ -310,6 +486,7 @@ def run_pipeline(
     # --- optional output paths ---
     output_assignments: Optional[str] = None,
     output_unbooked: Optional[str] = None,
+    output_remaining_flights: Optional[str] = None,
     print_summary: bool = False,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Run the passenger re-accommodation QUBO pipeline.
@@ -332,6 +509,11 @@ def run_pipeline(
         SA cooling rate.
     seed : int
         RNG seed.
+    max_passes : int
+        How many full solve-cycles to run.  After each pass the remaining
+        unbooked passengers are re-queued against the updated flight capacity.
+        Stops early when no new assignments are made or all
+        passengers are placed
     filter_level : {'minimal', 'moderate', 'aggressive', 'ultra'}
     batch_strategy : {'none','by_route','by_time_window','by_cabin',
                       'by_route_and_time','by_priority_tier','auto'}
@@ -360,13 +542,16 @@ def run_pipeline(
         Manual CVM split points (ascending). If provided, overrides
         ``priority_bins``. E.g. ``[2.0, 5.0, 9.0]`` -> 4 bins.
     weights : QUBOWeights | None
-        Full weight override (ignores individual weight kwargs).
+        Full weight override.
     preprocessing : PreprocessingConfig | None
         Full preprocessing config override.
     output_assignments : str | None
         Save assignments CSV to this path.
     output_unbooked : str | None
         Save unbooked CSV to this path.
+    output_remaining_flights : str | None
+        Save the updated available-flights CSV
+        to this path.
     print_summary : bool
 
     Returns
@@ -412,6 +597,7 @@ def run_pipeline(
         target_csv=cancelled,
         available_csv=available,
         method=method,
+        max_passes=max_passes,
         num_reads=num_reads,
         T_init=t_init,
         alpha=alpha,
@@ -427,5 +613,7 @@ def run_pipeline(
     if output_unbooked and len(unbooked_df):
         unbooked_df.to_csv(output_unbooked, index=False)
         logger.info("Unbooked saved to %s", output_unbooked)
+    if output_remaining_flights:
+        pipeline.export_remaining_flights(output_remaining_flights)
 
     return assignments_df, unbooked_df

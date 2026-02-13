@@ -79,6 +79,7 @@ class SolutionInterpreter:
         # Key is passenger index i — unique per (RECLOC, DEP_KEY) segment
         # within this batch.
         assigned_pax: set = set()
+        unbooked_pax: set = set()  # tracks passengers added to unbooked list
 
         for idx, val in solution.items():
             if val != 1:
@@ -187,6 +188,7 @@ class SolutionInterpreter:
                     continue
                 pax = self.passengers[i]
                 if pax.is_affected:
+                    unbooked_pax.add(i)
                     unbooked.append(
                         {
                             "RECLOC": pax.recloc,
@@ -228,6 +230,59 @@ class SolutionInterpreter:
                         }
                     )
 
+        # Force any affected passenger that the solver
+        # left in the all-zeros state (neither assigned nor slack=1) into unbooked.
+        # This happens when the all-zeros QUBO energy is lower than both the slack and assignment diagonals
+        for i, pax in enumerate(self.passengers):
+            if pax.is_affected and i not in assigned_pax and i not in unbooked_pax:
+                logger.warning(
+                    "Passenger %d (%s|%s) had all variables=0 in solver output "
+                    "(constraint violation / weight imbalance); forcing unbooked.",
+                    i, pax.recloc, pax.dep_key,
+                )
+                unbooked.append(
+                    {
+                        "RECLOC": pax.recloc,
+                        "CABIN_CD": pax.cabin_cd,
+                        "COS_CD": pax.cos_cd,
+                        "OPER_OD_ORIG_CD": pax.oper_od_orig_cd,
+                        "OPER_OD_DEST_CD": pax.oper_od_dest_cd,
+                        "DEP_KEY": pax.dep_key,
+                        "DEP_DT": _fmt(pax.dep_dtml, "%m/%d/%Y"),
+                        "ORIG_CD": pax.orig_cd,
+                        "DEST_CD": pax.dest_cd,
+                        "FLT_NUM": pax.flt_num,
+                        "DEP_DTML": _fmt(pax.dep_dtml, "%m/%d/%Y %H:%M"),
+                        "ARR_DTML": _fmt(pax.arr_dtml, "%m/%d/%Y %H:%M"),
+                        "DEP_DTMZ": _fmt(pax.dep_dtmz, "%m/%d/%Y %H:%M"),
+                        "ARR_DTMZ": _fmt(pax.arr_dtmz, "%m/%d/%Y %H:%M"),
+                        "PREV_OD_BROKEN_IND": pax.od_broken_ind,
+                        "PAX_CNT": pax.pax_cnt,
+                        "CVM": pax.cvm,
+                        "PREV_CONN_TIME_MINS": pax.conn_time_mins,
+                        "ALT_DEP_KEY": "",
+                        "ALT_CABIN_CD": "",
+                        "ALT_OPER_OD_ORIG_CD": "",
+                        "ALT_OPER_OD_DEST_CD": "",
+                        "ALT_DEP_DT": "",
+                        "ALT_ORIG_CD": "",
+                        "ALT_DEST_CD": "",
+                        "ALT_FLT_NUM": "",
+                        "ALT_DEP_DTML": "",
+                        "ALT_ARR_DTML": "",
+                        "ALT_DEP_DTMZ": "",
+                        "ALT_ARR_DTMZ": "",
+                        "ALT_CONN_TIME_MINS": "",
+                        "IS_AFFECTED": True,
+                        "IS_DIRECT": False,
+                        "ORIG_CABIN": pax.cabin_cd,
+                        "ITINERARY_CABINS": "",
+                        "DEP_CHANGE_MINS": 0.0,
+                    }
+                )
+
+        # Build Dfs. Keep _itin_id so _merge_results can deduplicate
+        # cross-batch duplicates without discarding multi-leg alt legs.
         if assignments:
             assign_df = pd.DataFrame(assignments)
             cols = [c for c in OUTPUT_COLUMNS if c in assign_df.columns] + ["_itin_id"]

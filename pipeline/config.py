@@ -51,12 +51,12 @@ class PreprocessingConfig:
     filter_level: CandidateFilterLevel = CandidateFilterLevel.MODERATE
     time_window_before_hours: float = 2.0
     time_window_after_hours: float = 6.0
-    max_candidates_per_passenger: int = 10
+    max_candidates_per_passenger: int = 50
     same_cabin_only: bool = False
 
-    # Require at least 2 available seats before a flight enters the
+    # Require at least 1 available seats before a flight enters the
     # candidate pool.
-    min_available_seats: int = 2
+    min_available_seats: int = 1
 
     batch_strategy: BatchStrategy = BatchStrategy.AUTO
     time_batch_window_hours: float = 4.0
@@ -98,10 +98,16 @@ class QUBOWeights:
     """
 
     # --- Hard constraints ---
-    # capacity_violation_penalty must dominate all other signals.
+    # one_assignment_penalty must exceed:
+    #   (a) max unbooked_passenger_penalty * max_pax_cnt  (so slack=1 beats all-zeros)
+    #   (b) capacity_violation_penalty - one_assignment_penalty (so assign-to-full-flight
+    #       beats all-zeros for passengers whose only options are full flights).
+    # Rule of thumb: one_assignment_penalty ≈ capacity_violation_penalty × 0.6
+    # capacity_violation_penalty must still be the single largest penalty so that
+    # capacity is never violated in favour of satisfying the one-assignment constraint.
     capacity_violation_penalty: float = 2500000.0
     connection_break_penalty: float = 200000.0
-    one_assignment_penalty: float = 200000.0
+    one_assignment_penalty: float = 1500000.0
 
     # --- Soft penalties ---
     unbooked_passenger_penalty: float = 8000.0
@@ -114,7 +120,7 @@ class QUBOWeights:
     cvm_priority_weight: float = 50.0
     group_size_weight: float = 5.0
 
-    time_window_hours: float = 6.0
+    time_window_hours: float = 48.0
     time_window_soft_penalty: float = 2.0
 
     # Overbooking disabled by default so zero-avail flights are never offered
