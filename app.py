@@ -7,11 +7,11 @@ import threading
 import queue
 import time
 import random
-from shinywidgets import render_plotly
 import logging
 
 from pipeline import run_pipeline
 from utils import get_data_frames, QueueHandler
+from post_analysis import run_post_analysis
 
 canceled_flights = "./notebooks/data/PRMI-DM_TARGET_FLIGHTS.csv"
 available_flights = "./notebooks/data/PRMI-DM-AVAILABLE_FLIGHTS.csv"
@@ -20,6 +20,7 @@ all_pnrs = "./notebooks/data/PRMI_DM_ALL_PNRs.csv"
 df_affected_flights, df_available_flights, df_pnrs = get_data_frames(
     canceled_flights, available_flights, all_pnrs
 )
+
 ### Dashboard App ###
 
 with ui.div(
@@ -50,7 +51,6 @@ with ui.layout_columns(col_widths=[4, 4, 4]):
                 names="Status",
                 hole=0.4,
                 color="Status",
-                # Custom colors: Red for affected, Blue for non-affected
                 color_discrete_map={"Affected": "#d3462d", "Non-Affected": "#363636"},
             )
             fig.update_traces(textinfo="percent+label")
@@ -75,7 +75,6 @@ with ui.layout_columns(col_widths=[4, 4, 4]):
                 names="Status",
                 hole=0.4,
                 color="Status",
-                # Custom colors: Red for affected, Blue for non-affected
                 color_discrete_map={"Affected": "#d3462d", "Non-Affected": "#363636"},
             )
             fig.update_traces(textinfo="percent+label")
@@ -104,10 +103,7 @@ with ui.layout_columns(col_widths=[4, 4, 4]):
                 x="DEP_DT",
                 y="Total_Passengers",
                 color="Cabin Class",
-                # -- STACKING ORDER --
-                # This tells Plotly: Put Economy at the bottom, Business on top.
                 category_orders={"Cabin Class": ["Economy", "Business"]},
-                # Custom colors (Business = Blue, Economy = Orange)
                 color_discrete_map={"Business": "#A09F9F", "Economy": "#363636"},
             )
 
@@ -180,7 +176,6 @@ with ui.card(full_screen=True, height="500px"):
             color="Type",
             color_discrete_map={
                 "Origin": "#d3462d",
-                # "Destination": "#2d8ad3",
             },
             hover_name="City_Code",
         )
@@ -194,9 +189,7 @@ with ui.card(full_screen=True, height="500px"):
         )
 
         fig.update_traces(
-            selector=dict(
-                type="scattermap", mode="lines"
-            ),  # Selects only the line layer
+            selector=dict(type="scattermap", mode="lines"),
             line=dict(width=1),
         )
 
@@ -224,16 +217,16 @@ def run_optimization_task(params, msg_queue, shared_state):
             "available": "notebooks/data/PRMI-DM-AVAILABLE_FLIGHTS.csv",
             "batch_strategy": batch_strategy,
             "priority_bins": 30,
+            "time_window_after": 72.0,
+            "enable_multi_leg": True,
+            "max_legs": 2,
+            "max_passes": 2,
             "output_unbooked": "output_files/priority_batch_unbooked_updated.csv",
             "output_assignments": "output_files/priority_batch_results_updated.csv",
         }
 
         msg_queue.put(f"INFO: Starting {method} optimization...")
         assignments, unbooked = run_pipeline(**kwargs)
-
-        steps = []
-        values = []
-        current_val = 100.0
 
         shared_state["result"] = (assignments, unbooked)
         shared_state["status"] = "done"
@@ -254,7 +247,6 @@ with ui.card(full_screen=True, height="600px"):
         with ui.div():
             ui.h5("Configuration")
 
-            # Dropdowns for parameters
             ui.input_select(
                 "opt_method",
                 "Optimization Method",
@@ -282,13 +274,46 @@ with ui.card(full_screen=True, height="600px"):
             )
 
         with ui.div():
-            # Logging window
             ui.h6("Execution Logs")
             ui.div(
                 id="log_container",
                 style="height: 400px; overflow-y: auto; background-color: #1e1e1e; padding: 10px; border: 1px solid #555;white-space: pre-wrap;",
             )
 
+
+########### Post-Analysis Card ###################
+
+with ui.card():
+    ui.card_header("Post-Analysis: Phase 2 Rules Set")
+
+    @render.ui
+    def analysis_output():
+        report = analysis_report.get()
+        if report is None:
+            return ui.div(
+                ui.p(
+                    "Run the optimizer to see rule-set validation results.",
+                    style="color: #888; font-style: italic; margin: 10px 0;",
+                )
+            )
+        # Determine whether there's a warning (overbooking detected)
+        has_warning = "OVERBOOKING DETECTED" in report
+        border_color = "#C0392B" if has_warning else "#27AE60"
+        return ui.div(
+            ui.pre(
+                report,
+                style=(
+                    "font-size: 11px; font-family: 'Courier New', monospace;"
+                    " background-color: #1e1e1e; color: #d4d4d4;"
+                    f" border-left: 4px solid {border_color};"
+                    " padding: 15px; border-radius: 4px;"
+                    " overflow-x: auto; white-space: pre;"
+                ),
+            )
+        )
+
+
+########### Reactive state ###################
 
 session_context = {
     "queue": queue.Queue(),
@@ -299,6 +324,7 @@ logs = reactive.Value("")
 progress = reactive.Value(0)
 is_running = reactive.Value(False)
 result_df = reactive.Value(None)
+analysis_report = reactive.Value(None)
 
 
 @reactive.Effect
@@ -318,6 +344,7 @@ def start_optimization():
     )
     progress.set(0)
     result_df.set(None)
+    analysis_report.set(None)
     is_running.set(True)
 
     session_context["state"] = {"progress": 0, "status": "running", "result": None}
@@ -329,7 +356,6 @@ def start_optimization():
         "batch_strategy": input.batch_stg(),
     }
 
-    # 4. Launch Thread
     t = threading.Thread(
         target=run_optimization_task,
         args=(params, session_context["queue"], session_context["state"]),
@@ -350,10 +376,7 @@ def poll_background_thread():
 
     try:
         while True:
-            # Get one message
             msg = q.get_nowait()
-
-            # CHANGE: Insert immediately instead of appending to a list
             ui.insert_ui(
                 selector="#log_container",
                 where="beforeEnd",
@@ -377,8 +400,19 @@ def poll_background_thread():
     if status in ["done", "error"]:
         is_running.set(False)
         if status == "done":
+            assignments, unbooked = s["result"]
             result_df.set(s["result"])
-            ui.notification_show("Optimization Complete!", type="message")
+            ui.notification_show("Optimization Complete! Running post-analysis...", type="message")
+            # Run post-analysis on the in-memory DataFrames
+            try:
+                report = run_post_analysis(
+                    assignments_df=assignments,
+                    unbooked_df=unbooked,
+                    available_flights=available_flights,
+                )
+                analysis_report.set(report)
+            except Exception as exc:
+                analysis_report.set(f"Post-analysis error: {exc}")
         else:
             ui.notification_show("Optimization Failed", type="error")
             return
